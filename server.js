@@ -4,67 +4,105 @@ import fetch from 'node-fetch';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 1. 真实音频管道代理（智能兼容 cdn1/cdn2 CDN，规避 404 与防盗链）
+// 1. 真实音频管道代理（支持 Range 进度条拖动与分段缓冲，杜绝 403 与 0:00 假死）
 app.get('/api/audio-stream', async (req, res) => {
   const { url: audioUrl, name } = req.query;
   if (!audioUrl) return res.status(400).send('缺少音频链接');
 
   try {
-    let upstreamRes = await fetch(audioUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        'Referer': 'https://suno.com/'
-      }
-    });
-
-    // 如果 cdn1 报错，自动切换备用 cdn2 节点
-    if (!upstreamRes.ok && audioUrl.includes('cdn1.suno.ai')) {
-      const fallbackUrl = audioUrl.replace('cdn1.suno.ai', 'cdn2.suno.ai');
-      upstreamRes = await fetch(fallbackUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-          'Referer': 'https://suno.com/'
-        }
-      });
+    const upstreamHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': '*/*'
+    };
+    if (req.headers.range) {
+      upstreamHeaders['Range'] = req.headers.range;
     }
 
-    if (!upstreamRes.ok) throw new Error(`上游响应失败: ${upstreamRes.status}`);
+    let upstreamRes = await fetch(audioUrl, { headers: upstreamHeaders });
+
+    // 若 cdn1 报错，自动降级至 cdn2
+    if (!upstreamRes.ok && audioUrl.includes('cdn1.suno.ai')) {
+      const fallbackUrl = audioUrl.replace('cdn1.suno.ai', 'cdn2.suno.ai');
+      upstreamRes = await fetch(fallbackUrl, { headers: upstreamHeaders });
+    }
+
+    if (!upstreamRes.ok) {
+      throw new Error(`上游响应失败: ${upstreamRes.status} (${audioUrl})`);
+    }
 
     const safeName = (name || 'suno_track').replace(/[\r\n"\\\/]/g, '_');
+    
+    // 透传音频状态码与 Content-Range（支持播放器计算总时长与快进）
+    res.status(upstreamRes.status);
     res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(safeName)}.mp3`);
+    res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (upstreamRes.headers.get('content-range')) {
+      res.setHeader('Content-Range', upstreamRes.headers.get('content-range'));
+    }
+    if (upstreamRes.headers.get('content-length')) {
+      res.setHeader('Content-Length', upstreamRes.headers.get('content-length'));
+    }
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(safeName)}.mp3`);
 
     upstreamRes.body.pipe(res);
   } catch (err) {
-    console.error('Audio stream error:', err);
+    console.error('Audio stream error:', err.message);
     res.status(500).send('音频提取失败: ' + err.message);
   }
 });
 
-// 2. 歌曲元数据解析接口（动态提取真实 CDN 音频源）
+// 2. 歌曲元数据解析接口（支持短链重定向精准提取真实歌曲 ID）
 app.get('/api/parse', async (req, res) => {
   const { url: inputUrl } = req.query;
   if (!inputUrl) return res.status(400).json({ error: '请提供 Suno 链接' });
 
   try {
-    let target = inputUrl.trim();
-    let pageRes = await fetch(target, {
+    const target = inputUrl.trim();
+    const pageRes = await fetch(target, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        'Referer': 'https://suno.com/'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       },
       redirect: 'follow'
     });
 
+    const finalUrl = pageRes.url;
     const html = await pageRes.text();
 
-    // 提取 UUID
-    const uuidMatch = html.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/) 
-                   || target.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
+    // 优先顺序提取真正的歌曲 ID，避免误抓作者 ID 或其他组件 ID
+    let songId = null;
 
-    if (!uuidMatch) throw new Error('未能从链接定位到歌曲 ID');
-    const songId = uuidMatch[0];
+    // 规则 1：从最终重定向后的 URL 提取（例如 /song/xxxx）
+    const finalUrlMatch = finalUrl.match(/\/song\/([0-9a-fA-F-]{36})/);
+    if (finalUrlMatch) songId = finalUrlMatch[1];
+
+    // 规则 2：从页面的 canonical 或 og:url 提取
+    if (!songId) {
+      const ogUrlMatch = html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i)
+                      || html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i);
+      if (ogUrlMatch) {
+        const idMatch = ogUrlMatch[1].match(/([0-9a-fA-F-]{36})/);
+        if (idMatch) songId = idMatch[1];
+      }
+    }
+
+    // 规则 3：从页面内音频或视频 CDN 资源直链中提取
+    if (!songId) {
+      const cdnMatch = html.match(/cdn[12]\.suno\.ai\/([0-9a-fA-F-]{36})\.(mp3|mp4)/i);
+      if (cdnMatch) songId = cdnMatch[1];
+    }
+
+    // 规则 4：兜底输入链接自身
+    if (!songId) {
+      const directMatch = target.match(/([0-9a-fA-F-]{36})/);
+      if (directMatch) songId = directMatch[1];
+    }
+
+    if (!songId) {
+      throw new Error('无法从当前链接提取到有效的歌曲 ID，请确认链接是否公开。');
+    }
 
     // 提取歌名
     const titleMatch = html.match(/<meta property="og:title" content="(.*?)"/i) 
@@ -73,25 +111,20 @@ app.get('/api/parse', async (req, res) => {
 
     // 提取封面
     const imgMatch = html.match(/<meta property="og:image" content="(.*?)"/i);
-    let cover = imgMatch ? imgMatch[1] : `https://cdn2.suno.ai/image_large_${songId}.jpeg`;
+    const cover = imgMatch ? imgMatch[1] : `https://cdn2.suno.ai/image_large_${songId}.jpeg`;
 
-    // 优先从页面元数据中提取真实音频直链，若无则使用标准 CDN 地址
-    let realAudio = '';
-    const audioUrlMatch = html.match(/"audio_url":"(https:\/\/[^"]+)"/i) 
-                       || html.match(/https:\/\/cdn[12]\.suno\.ai\/[0-9a-fA-F-]+\.mp3/i);
-    if (audioUrlMatch) {
-      realAudio = (audioUrlMatch[1] || audioUrlMatch[0]).replace(/\\u0026/g, '&');
-    } else {
-      realAudio = `https://cdn1.suno.ai/${songId}.mp3`;
-    }
+    const cdnAudioUrl = `https://cdn1.suno.ai/${songId}.mp3`;
+    const streamProxyUrl = `/api/audio-stream?url=${encodeURIComponent(cdnAudioUrl)}&name=${encodeURIComponent(title)}`;
 
     res.json({
       id: songId,
       title,
       cover,
-      stream_url: `/api/audio-stream?url=${encodeURIComponent(realAudio)}&name=${encodeURIComponent(title)}`
+      audio_url: cdnAudioUrl,
+      stream_url: streamProxyUrl
     });
   } catch (e) {
+    console.error('Parse error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -159,7 +192,7 @@ app.get('*', (req, res) => {
         </div>
       </div>
       <div class="btn-group">
-        <a id="btnMp3" class="btn-dl btn-mp3" href="#" download="suno_song.mp3">⇩ 下载 MP3 音频</a>
+        <a id="btnMp3" class="btn-dl btn-mp3" href="#">⇩ 下载 MP3 音频</a>
         <button id="btnWav" class="btn-dl btn-wav" onclick="runWav()">⇩ 下载 WAV 音频</button>
       </div>
     </div>
@@ -168,13 +201,13 @@ app.get('*', (req, res) => {
       <h3>📌 使用说明</h3>
       <ul>
         <li>支持短链（如 <code>suno.com/s/...</code>）与常规播放链接。</li>
-        <li>音频数据由专属服务器伪装合法请求后流式输出，杜绝防盗链拦截与 8KB 报错文件。</li>
+        <li>音频数据由专属服务器流式代理，自动处理反盗链与分段缓冲。</li>
       </ul>
     </div>
   </div>
 
   <script>
-    let streamUrl = '';
+    let activeStreamUrl = '';
     let currentFileName = 'suno_audio';
 
     async function runParse() {
@@ -199,19 +232,20 @@ app.get('*', (req, res) => {
         const data = await res.json();
         if (data.error) throw new Error(data.error);
 
-        streamUrl = data.stream_url;
+        activeStreamUrl = data.stream_url;
         currentFileName = (data.title || 'suno_audio').replace(/[\\\\/:*?"<>|]/g, '_');
 
         document.getElementById('cover').src = data.cover;
         document.getElementById('songTitle').innerText = data.title;
         
         const player = document.getElementById('audioPlayer');
-        player.src = streamUrl;
+        // 播放器直接载入流地址
+        player.src = activeStreamUrl;
         player.load();
 
         const btnMp3 = document.getElementById('btnMp3');
-        btnMp3.href = streamUrl;
-        btnMp3.download = currentFileName + '.mp3';
+        btnMp3.href = activeStreamUrl;
+        btnMp3.setAttribute('download', currentFileName + '.mp3');
 
         msg.style.color = '#10b981';
         msg.innerText = '✓ 解析成功！';
@@ -225,14 +259,14 @@ app.get('*', (req, res) => {
     }
 
     async function runWav() {
-      if (!streamUrl) return;
+      if (!activeStreamUrl) return;
       const btn = document.getElementById('btnWav');
       const oldText = btn.innerText;
       try {
         btn.disabled = true;
         btn.innerText = '本地转码中...';
 
-        const r = await fetch(streamUrl);
+        const r = await fetch(activeStreamUrl);
         const buf = await r.arrayBuffer();
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
         const decoded = await ctx.decodeAudioData(buf);
