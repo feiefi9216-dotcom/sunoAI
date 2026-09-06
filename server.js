@@ -160,7 +160,7 @@ app.get('*', (req, res) => {
       </div>
       <div class="btn-group">
         <a id="btnMp3" class="btn-dl btn-mp3" href="#" download="suno_song.mp3">⇩ 下载 MP3 音频</a>
-        <button id="btnWav" class="btn-dl btn-wav" onclick="runWav()">⇩ 本地转码 WAV</button>
+        <button id="btnWav" class="btn-dl btn-wav" onclick="runWav()">⇩ 下载 WAV 音频</button>
       </div>
     </div>
 
