@@ -4,33 +4,45 @@ import fetch from 'node-fetch';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 1. 真实音频管道代理（注入 Suno 官方 Referer，杜绝防盗链与空文件）
+// 1. 真实音频管道代理（智能兼容 cdn1/cdn2 CDN，规避 404 与防盗链）
 app.get('/api/audio-stream', async (req, res) => {
   const { url: audioUrl, name } = req.query;
   if (!audioUrl) return res.status(400).send('缺少音频链接');
 
   try {
-    const upstreamRes = await fetch(audioUrl, {
+    let upstreamRes = await fetch(audioUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        'Referer': 'https://suno.com/',
-        'Origin': 'https://suno.com'
+        'Referer': 'https://suno.com/'
       }
     });
 
+    // 如果 cdn1 报错，自动切换备用 cdn2 节点
+    if (!upstreamRes.ok && audioUrl.includes('cdn1.suno.ai')) {
+      const fallbackUrl = audioUrl.replace('cdn1.suno.ai', 'cdn2.suno.ai');
+      upstreamRes = await fetch(fallbackUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+          'Referer': 'https://suno.com/'
+        }
+      });
+    }
+
     if (!upstreamRes.ok) throw new Error(`上游响应失败: ${upstreamRes.status}`);
 
+    const safeName = (name || 'suno_track').replace(/[\r\n"\\\/]/g, '_');
     res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(name || 'suno_track')}.mp3"`);
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(safeName)}.mp3`);
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     upstreamRes.body.pipe(res);
   } catch (err) {
+    console.error('Audio stream error:', err);
     res.status(500).send('音频提取失败: ' + err.message);
   }
 });
 
-// 2. 歌曲元数据解析接口（支持短链客户端路由还原）
+// 2. 歌曲元数据解析接口（动态提取真实 CDN 音频源）
 app.get('/api/parse', async (req, res) => {
   const { url: inputUrl } = req.query;
   if (!inputUrl) return res.status(400).json({ error: '请提供 Suno 链接' });
@@ -47,25 +59,37 @@ app.get('/api/parse', async (req, res) => {
 
     const html = await pageRes.text();
 
+    // 提取 UUID
     const uuidMatch = html.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/) 
                    || target.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
 
     if (!uuidMatch) throw new Error('未能从链接定位到歌曲 ID');
     const songId = uuidMatch[0];
 
-    const titleMatch = html.match(/<meta property="og:title" content="(.*?)"/i) || html.match(/<title>(.*?)<\/title>/i);
+    // 提取歌名
+    const titleMatch = html.match(/<meta property="og:title" content="(.*?)"/i) 
+                    || html.match(/<title>(.*?)<\/title>/i);
     let title = titleMatch ? titleMatch[1].replace(' | Suno', '').trim() : 'Suno 音乐';
 
+    // 提取封面
     const imgMatch = html.match(/<meta property="og:image" content="(.*?)"/i);
     let cover = imgMatch ? imgMatch[1] : `https://cdn2.suno.ai/image_large_${songId}.jpeg`;
 
-    const rawAudio = `https://audiopipe.suno.ai/?item_id=${songId}`;
+    // 优先从页面元数据中提取真实音频直链，若无则使用标准 CDN 地址
+    let realAudio = '';
+    const audioUrlMatch = html.match(/"audio_url":"(https:\/\/[^"]+)"/i) 
+                       || html.match(/https:\/\/cdn[12]\.suno\.ai\/[0-9a-fA-F-]+\.mp3/i);
+    if (audioUrlMatch) {
+      realAudio = (audioUrlMatch[1] || audioUrlMatch[0]).replace(/\\u0026/g, '&');
+    } else {
+      realAudio = `https://cdn1.suno.ai/${songId}.mp3`;
+    }
 
     res.json({
       id: songId,
       title,
       cover,
-      stream_url: `/api/audio-stream?url=${encodeURIComponent(rawAudio)}&name=${encodeURIComponent(title)}`
+      stream_url: `/api/audio-stream?url=${encodeURIComponent(realAudio)}&name=${encodeURIComponent(title)}`
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
